@@ -64,6 +64,7 @@ jobs:
               const firstLine = (value || '').split('\n')[0].trim();
               return firstLine.length >= 12 && !genericCommitMessages.has(normalize(firstLine));
             };
+            const checked = value => value ? '✅' : '⬜';
 
             const { data: repoInfo } = await github.rest.repos.get({ owner, repo });
             if (repoFullName === 'hbycwyh2008/github-team-launch-skill' || repoInfo.is_template) {
@@ -118,7 +119,18 @@ jobs:
 
             const issueFor = {};
             for (const [role, config] of Object.entries(featureConfig)) issueFor[role] = findIssueByTitle(config.issueTitle);
-            const featureIssuesExist = Object.values(issueFor).every(Boolean);
+
+            const htmlIssueEvidence = Boolean(issueFor.html);
+            const cssIssueEvidence = Boolean(issueFor.css);
+            const javascriptIssueEvidence = Boolean(issueFor.javascript);
+            const featureIssuesExist = htmlIssueEvidence && cssIssueEvidence && javascriptIssueEvidence;
+
+            const htmlAssignedEvidence = Boolean(issueFor.html && (issueFor.html.assignees || []).some(user => user.login === ownerLogin));
+            const cssAssignee = issueFor.css?.assignees?.find(user => user.login !== ownerLogin)?.login || null;
+            const javascriptAssignee = issueFor.javascript?.assignees?.find(user => user.login !== ownerLogin)?.login || null;
+            const cssAssignedEvidence = Boolean(cssAssignee);
+            const javascriptAssignedEvidence = Boolean(javascriptAssignee && javascriptAssignee !== cssAssignee);
+            const assignmentTeamEvidence = htmlAssignedEvidence && cssAssignedEvidence && javascriptAssignedEvidence;
 
             let projectEvidence = false;
             let projectUrl = '';
@@ -131,16 +143,27 @@ jobs:
                 if (!Object.values(issueFor).every(issue => body.includes(issue.html_url))) continue;
                 try {
                   const response = await fetch(match[1], { redirect: 'follow', headers: { 'User-Agent': 'github-team-launch-checker' } });
-                  if (response.ok) { projectEvidence = true; projectUrl = match[1]; break; }
-                } catch (error) { core.info(`Project URL check failed: ${error.message}`); }
+                  if (response.ok) {
+                    projectEvidence = true;
+                    projectUrl = match[1];
+                    break;
+                  }
+                } catch (error) {
+                  core.info(`Project URL check failed: ${error.message}`);
+                }
               }
             }
-            const step1 = featureIssuesExist && projectEvidence;
+
+            const step1 = featureIssuesExist && assignmentTeamEvidence && projectEvidence;
             if (step1) await ensureStep(2);
 
             const branches = await github.paginate(github.rest.repos.listBranches, { owner, repo, per_page: 100 });
             const branchNames = new Set(branches.map(branch => branch.name));
-            const featureBranchEvidence = Object.values(featureConfig).every(config => branchNames.has(config.branch));
+            const htmlBranchEvidence = branchNames.has(featureConfig.html.branch);
+            const cssBranchEvidence = branchNames.has(featureConfig.css.branch);
+            const javascriptBranchEvidence = branchNames.has(featureConfig.javascript.branch);
+            const featureBranchEvidence = htmlBranchEvidence && cssBranchEvidence && javascriptBranchEvidence;
+
             const step2 = step1 && featureBranchEvidence;
             if (step2) await ensureStep(3);
 
@@ -149,16 +172,25 @@ jobs:
             const prFor = {};
             for (const [role, config] of Object.entries(featureConfig)) prFor[role] = pullForBranch(config.branch);
 
-            const roleUsers = {
+            const htmlPrEvidence = Boolean(prFor.html);
+            const cssPrEvidence = Boolean(prFor.css);
+            const javascriptPrEvidence = Boolean(prFor.javascript);
+            const allPrEvidence = htmlPrEvidence && cssPrEvidence && javascriptPrEvidence;
+
+            const prUsers = {
               html: prFor.html?.user?.login || null,
               css: prFor.css?.user?.login || null,
               javascript: prFor.javascript?.user?.login || null
             };
 
             const roleSeparationEvidence = Boolean(
-              prFor.html && prFor.css && prFor.javascript &&
-              roleUsers.html === ownerLogin && roleUsers.css && roleUsers.javascript &&
-              roleUsers.css !== ownerLogin && roleUsers.javascript !== ownerLogin && roleUsers.css !== roleUsers.javascript
+              allPrEvidence &&
+              prUsers.html === ownerLogin &&
+              prUsers.css === cssAssignee &&
+              prUsers.javascript === javascriptAssignee &&
+              prUsers.css !== ownerLogin &&
+              prUsers.javascript !== ownerLogin &&
+              prUsers.css !== prUsers.javascript
             );
             const sameRepoAccessEvidence = Boolean(
               prFor.html?.head?.repo?.full_name === repoFullName &&
@@ -166,11 +198,6 @@ jobs:
               prFor.javascript?.head?.repo?.full_name === repoFullName
             );
             const teamAccessEvidence = roleSeparationEvidence && sameRepoAccessEvidence;
-
-            const assignedTo = (issue, login) => Boolean(issue && login && (issue.assignees || []).some(user => user.login === login));
-            const issueAssignmentEvidence = Boolean(
-              assignedTo(issueFor.html, ownerLogin) && assignedTo(issueFor.css, roleUsers.css) && assignedTo(issueFor.javascript, roleUsers.javascript)
-            );
 
             let prQualityEvidence = true;
             let fileScopeEvidence = true;
@@ -181,7 +208,13 @@ jobs:
             for (const [role, config] of Object.entries(featureConfig)) {
               const pr = prFor[role];
               const issue = issueFor[role];
-              if (!pr || !issue) { prQualityEvidence = fileScopeEvidence = meaningfulCommitEvidence = localCommitEvidence = false; continue; }
+              if (!pr || !issue) {
+                prQualityEvidence = false;
+                fileScopeEvidence = false;
+                meaningfulCommitEvidence = false;
+                localCommitEvidence = false;
+                continue;
+              }
 
               const body = pr.body || '';
               const hasSections = /what changed/i.test(body) && /why/i.test(body) && /testing/i.test(body);
@@ -199,24 +232,32 @@ jobs:
               if (!commits.some(commit => meaningfulCommitMessage(commit.commit?.message) && commit.committer?.login !== 'web-flow' && normalize(commit.commit?.committer?.name) !== 'github')) localCommitEvidence = false;
             }
 
-            const allPrEvidence = Object.values(prFor).every(Boolean);
-            const step3 = step2 && allPrEvidence && teamAccessEvidence && issueAssignmentEvidence && prQualityEvidence && fileScopeEvidence && meaningfulCommitEvidence && localCommitEvidence;
+            const step3 = step2 && allPrEvidence && teamAccessEvidence && prQualityEvidence && fileScopeEvidence && meaningfulCommitEvidence && localCommitEvidence;
             if (step3) await ensureStep(4);
 
-            let ownerReviewEvidence = true;
+            const ownerReviewByRole = { css: false, javascript: false };
             let feedbackCycleEvidence = false;
             for (const role of ['css', 'javascript']) {
               const pr = prFor[role];
-              if (!pr) { ownerReviewEvidence = false; continue; }
+              if (!pr) continue;
               const reviews = await github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number: pr.number, per_page: 100 });
               const inlineComments = await github.paginate(github.rest.pulls.listReviewComments, { owner, repo, pull_number: pr.number, per_page: 100 });
-              const substantiveReview = reviews.some(review => review.user?.login === ownerLogin && ['APPROVED','CHANGES_REQUESTED','COMMENTED'].includes(review.state) && meaningfulText(review.body)) || inlineComments.some(comment => comment.user?.login === ownerLogin && meaningfulText(comment.body));
-              if (!substantiveReview) ownerReviewEvidence = false;
-              const changeRequests = reviews.filter(review => review.user?.login === ownerLogin && review.state === 'CHANGES_REQUESTED' && review.submitted_at && meaningfulText(review.body)).map(review => new Date(review.submitted_at).getTime());
+              ownerReviewByRole[role] =
+                reviews.some(review => review.user?.login === ownerLogin && ['APPROVED','CHANGES_REQUESTED','COMMENTED'].includes(review.state) && meaningfulText(review.body)) ||
+                inlineComments.some(comment => comment.user?.login === ownerLogin && meaningfulText(comment.body));
+
+              const changeRequests = reviews
+                .filter(review => review.user?.login === ownerLogin && review.state === 'CHANGES_REQUESTED' && review.submitted_at && meaningfulText(review.body))
+                .map(review => new Date(review.submitted_at).getTime());
               const commits = prCommits[role] || [];
-              if (changeRequests.some(requestTime => commits.some(commit => new Date(commit.commit?.author?.date || commit.commit?.committer?.date || 0).getTime() > requestTime))) feedbackCycleEvidence = true;
+              if (changeRequests.some(requestTime => commits.some(commit => new Date(commit.commit?.author?.date || commit.commit?.committer?.date || 0).getTime() > requestTime))) {
+                feedbackCycleEvidence = true;
+              }
             }
 
+            const cssReviewEvidence = ownerReviewByRole.css;
+            const javascriptReviewEvidence = ownerReviewByRole.javascript;
+            const ownerReviewEvidence = cssReviewEvidence && javascriptReviewEvidence;
             const step4 = step3 && ownerReviewEvidence && feedbackCycleEvidence;
             if (step4) await ensureStep(5);
 
@@ -228,7 +269,7 @@ jobs:
               ownerMergeEvidence = fullPrs.every(result => result.data.merged_by?.login === ownerLogin);
             }
 
-            const participants = roleSeparationEvidence ? [ownerLogin, roleUsers.css, roleUsers.javascript] : [];
+            const participants = assignmentTeamEvidence ? [ownerLogin, cssAssignee, javascriptAssignee] : [];
             const latestMergeTime = mergedEvidence ? Math.max(...Object.values(prFor).map(pr => new Date(pr.merged_at).getTime())) : 0;
             comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: exerciseIssue.number, per_page: 100 });
 
@@ -265,43 +306,120 @@ jobs:
                   liveSiteEvidence = /style\.css/i.test(liveHtml) && /script\.js/i.test(liveHtml) && liveCss.length >= 180 && /addEventListener\s*\(/.test(liveJs);
                 }
               }
-            } catch (error) { core.info(`Pages is not ready: ${error.message}`); }
+            } catch (error) {
+              core.info(`Pages is not ready: ${error.message}`);
+            }
 
             const step6 = step5 && liveSiteEvidence;
             if (step6) await ensureStep(7);
 
-            let reflectionEvidence = false;
-            if (participants.length === 3) {
-              const conceptPattern = /(branch|commit|push|pull request|review|merge|local|remote)/gi;
-              reflectionEvidence = participants.every(login => comments.some(comment => {
-                if (comment.user?.login !== login) return false;
-                const body = (comment.body || '').trim();
-                if (!/^REFLECTION:/i.test(body) || body.length < 120) return false;
-                return new Set((body.match(conceptPattern) || []).map(value => value.toLowerCase())).size >= 2;
-              }));
-            }
+            const conceptPattern = /(branch|commit|push|pull request|review|merge|local|remote)/gi;
+            const hasReflection = login => Boolean(login && comments.some(comment => {
+              if (comment.user?.login !== login) return false;
+              const body = (comment.body || '').trim();
+              if (!/^REFLECTION:/i.test(body) || body.length < 120) return false;
+              return new Set((body.match(conceptPattern) || []).map(value => value.toLowerCase())).size >= 2;
+            }));
+
+            const ownerReflectionEvidence = hasReflection(ownerLogin);
+            const cssReflectionEvidence = hasReflection(cssAssignee);
+            const javascriptReflectionEvidence = hasReflection(javascriptAssignee);
+            const reflectionEvidence = ownerReflectionEvidence && cssReflectionEvidence && javascriptReflectionEvidence;
             const step7 = step6 && reflectionEvidence;
 
-            const states = [step1,step2,step3,step4,step5,step6,step7];
-            const labels = ['Plan team, Issues, and Project evidence','Clone and create feature branches','Build locally and open quality PRs','Review and complete a feedback cycle','Owner merges, close Issues, and sync main','Publish and verify GitHub Pages','Submit three reflections'];
-            const passed = states.filter(Boolean).length;
-            const nextStep = states.findIndex(value => !value) + 1;
-            const dashboard = [
-              '# 🚀 GitHub Team Launch','',`**Progress:** ${passed}/7 steps complete`,'',
-              ...labels.map((label,index) => `${states[index] ? '✅' : '⬜'} Step ${index + 1} — ${label}`),'',
-              step7 ? '## 🏆 Exercise complete\nAll automatic checks passed.' : `## Current mission\nComplete **Step ${nextStep}** using the newest unlocked instruction comment below.`,'',
-              projectUrl ? `**Project evidence:** ${projectUrl}` : '', pagesUrl ? `**Published site:** ${pagesUrl}` : '','',
-              '> Do not close this Issue manually. The workflow closes it when the exercise is complete.'
-            ].filter(Boolean).join('\n');
+            const taskGroups = [
+              { step: 1, title: 'Plan team, Issues, and Project evidence', tasks: [
+                ['Create HTML Issue', htmlIssueEvidence],
+                ['Create CSS Issue', cssIssueEvidence],
+                ['Create JavaScript Issue', javascriptIssueEvidence],
+                ['Assign HTML Issue to Owner', htmlAssignedEvidence],
+                ['Assign CSS Issue to Collaborator A', cssAssignedEvidence],
+                ['Assign JavaScript Issue to Collaborator B', javascriptAssignedEvidence],
+                ['Submit valid Project evidence in this Exercise Issue', projectEvidence]
+              ]},
+              { step: 2, title: 'Clone and create feature branches', tasks: [
+                ['Push feature-html branch', htmlBranchEvidence],
+                ['Push feature-css branch', cssBranchEvidence],
+                ['Push feature-javascript branch', javascriptBranchEvidence]
+              ]},
+              { step: 3, title: 'Build locally and open quality PRs', tasks: [
+                ['Open HTML pull request', htmlPrEvidence],
+                ['Open CSS pull request', cssPrEvidence],
+                ['Open JavaScript pull request', javascriptPrEvidence],
+                ['Use the correct three team accounts in the same repository', teamAccessEvidence],
+                ['Write complete PR titles and descriptions with closing keywords', prQualityEvidence],
+                ['Keep each PR limited to its assigned source file', fileScopeEvidence],
+                ['Use meaningful commit messages', meaningfulCommitEvidence],
+                ['Include local command-line commits', localCommitEvidence]
+              ]},
+              { step: 4, title: 'Review and complete a feedback cycle', tasks: [
+                ['Owner reviews CSS PR with substantive feedback', cssReviewEvidence],
+                ['Owner reviews JavaScript PR with substantive feedback', javascriptReviewEvidence],
+                ['Complete at least one request-changes → new-commit cycle', feedbackCycleEvidence]
+              ]},
+              { step: 5, title: 'Owner merges, closes Issues, and syncs main', tasks: [
+                ['Merge all three pull requests', mergedEvidence],
+                ['Close all three feature Issues', issuesClosedEvidence],
+                ['Owner performs all merges', ownerMergeEvidence],
+                ['All three teammates report the final SYNCED main SHA', syncEvidence],
+                ['Integrated HTML, CSS, and JavaScript pass code checks', codeEvidence]
+              ]},
+              { step: 6, title: 'Publish and verify GitHub Pages', tasks: [
+                ['Published GitHub Pages site passes live checks', liveSiteEvidence]
+              ]},
+              { step: 7, title: 'Submit three reflections', tasks: [
+                ['Owner submits reflection', ownerReflectionEvidence],
+                ['Collaborator A submits reflection', cssReflectionEvidence],
+                ['Collaborator B submits reflection', javascriptReflectionEvidence]
+              ]}
+            ];
+
+            const states = [step1, step2, step3, step4, step5, step6, step7];
+            const completedStages = states.filter(Boolean).length;
+            const allTasks = taskGroups.flatMap(group => group.tasks);
+            const completedTasks = allTasks.filter(([, value]) => value).length;
+            const totalTasks = allTasks.length;
+            const nextStepIndex = states.findIndex(value => !value);
+            const nextStep = nextStepIndex === -1 ? 7 : nextStepIndex + 1;
+
+            const dashboardLines = [
+              '# 🚀 GitHub Team Launch',
+              '',
+              `**Overall progress:** ${completedTasks}/${totalTasks} tasks complete`,
+              `**Stage progress:** ${completedStages}/7 stages complete`,
+              ''
+            ];
+
+            for (const group of taskGroups) {
+              dashboardLines.push(`## ${checked(states[group.step - 1])} Step ${group.step} — ${group.title}`);
+              for (const [label, value] of group.tasks) dashboardLines.push(`${checked(value)} ${label}`);
+              dashboardLines.push('');
+            }
+
+            if (step7) {
+              dashboardLines.push('## 🏆 Exercise complete', 'All automatic checks passed.');
+            } else {
+              dashboardLines.push('## Current mission', `Complete **Step ${nextStep}** using the newest unlocked instruction comment below.`);
+            }
+            if (projectUrl) dashboardLines.push('', `**Project evidence:** ${projectUrl}`);
+            if (pagesUrl) dashboardLines.push('', `**Published site:** ${pagesUrl}`);
+            dashboardLines.push('', '> Do not close this Issue manually. The workflow closes it when the exercise is complete.');
+            const dashboard = dashboardLines.join('\n');
 
             if ((exerciseIssue.body || '') !== dashboard || exerciseIssue.state !== (step7 ? 'closed' : 'open')) {
-              const updated = await github.rest.issues.update({ owner, repo, issue_number: exerciseIssue.number, body: dashboard, state: step7 ? 'closed' : 'open', state_reason: step7 ? 'completed' : undefined });
+              const updated = await github.rest.issues.update({
+                owner, repo, issue_number: exerciseIssue.number, body: dashboard,
+                state: step7 ? 'closed' : 'open', state_reason: step7 ? 'completed' : undefined
+              });
               exerciseIssue = updated.data;
             }
 
             if (step7) {
               const completionMarker = '<!-- team-launch-complete -->';
               if (!comments.some(comment => (comment.body || '').includes(completionMarker))) {
-                await github.rest.issues.createComment({ owner, repo, issue_number: exerciseIssue.number, body: `${completionMarker}\n## 🏆 GitHub Team Launch complete\n\nAll seven stages and the automatic validation checks passed. Your team completed the full collaboration workflow and published the integrated site.` });
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: exerciseIssue.number,
+                  body: `${completionMarker}\n## 🏆 GitHub Team Launch complete\n\nAll seven stages and all granular validation checks passed. Your team completed the full collaboration workflow and published the integrated site.`
+                });
               }
             }
